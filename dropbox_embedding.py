@@ -1,8 +1,11 @@
 import re
+import io
 from typing import List, Sequence, Optional, Pattern
 from llama_index.core import Document
 from llama_index.core.schema import BaseNode
 from dropbox import Dropbox
+from dropbox.files import FileMetadata
+import dropbox
 
 
 class DropboxEmbeddingMethod:
@@ -30,6 +33,30 @@ class DropboxEmbeddingMethod:
             except re.error:
                 print(f"Invalid regex pattern: {pattern}")
         return compiled
+
+    def _process_binary_file(self, content: bytes, file_ext: str) -> str:
+        """Binary dosyaları işler (PDF, DOCX, XLSX)"""
+        try:
+            if file_ext == 'pdf':
+                from pdfminer.high_level import extract_text
+                return extract_text(io.BytesIO(content))
+            elif file_ext == 'docx':
+                from docx import Document as DocxDocument
+                doc = DocxDocument(io.BytesIO(content))
+                return "\n".join([para.text for para in doc.paragraphs])
+            elif file_ext == 'xlsx':
+                from openpyxl import load_workbook
+                wb = load_workbook(io.BytesIO(content))
+                text = ""
+                for sheet in wb:
+                    for row in sheet.iter_rows(values_only=True):
+                        text += " ".join(str(cell) for cell in row if cell) + "\n"
+                return text
+            else:
+                raise ValueError(f"Desteklenmeyen dosya uzantısı: {file_ext}")
+        except Exception as e:
+            print(f"Binary dosya işleme hatası: {str(e)}")
+            return ""
 
     def apply_rules(
         self,
@@ -76,7 +103,7 @@ class DropboxEmbeddingMethod:
         # Process all files
         while True:
             for entry in result.entries:
-                if not isinstance(entry, dropbox.files.FileMetadata):
+                if not isinstance(entry, FileMetadata):
                     continue
 
                 file_path = entry.path_display
@@ -87,15 +114,28 @@ class DropboxEmbeddingMethod:
                     _, response = dbx.files_download(file_path)
                     content = response.content
 
-                    if isinstance(content, bytes):
-                        try:
-                            content = content.decode('utf-8')
-                        except UnicodeDecodeError:
-                            print(f"[get_documents] Binary file skipped: {file_path}")
+                    # Text veya binary dosya işleme
+                    try:
+                        text_content = content.decode('utf-8-sig')  # Türkçe karakter desteği
+                    except UnicodeDecodeError:
+                        if file_ext in ['pdf', 'docx', 'xlsx']:
+                            print(f"[get_documents] Binary dosya işleniyor: {file_path}")
+                            text_content = self._process_binary_file(content, file_ext)
+                            if not text_content.strip():
+                                print(f"[get_documents] Boş içerik: {file_path}")
+                                continue
+                        elif file_ext in ['txt', 'log', 'md', 'csv']:
+                            try:
+                                text_content = content.decode('latin1')
+                            except Exception as e:
+                                print(f"[get_documents] Text dosya decode hatası: {file_path} - {str(e)}")
+                                continue
+                        else:
+                            print(f"[get_documents] Desteklenmeyen binary dosya: {file_path}")
                             continue
 
                     doc = Document(
-                        text=content,
+                        text=text_content,
                         metadata={
                             "file_path": file_path,
                             "file_name": file_name,
